@@ -1,47 +1,78 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import type { Dispatch, ReactNode, SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   BarChart3,
   CalendarDays,
   Check,
+  ChevronDown,
+  Copy,
   Dumbbell,
   Flame,
   History,
   Home,
   NotebookPen,
-  Plus,
-  Scale,
-  type LucideIcon
+  Play,
+  RotateCcw,
+  Search,
+  Settings,
+  Shield,
+  Sparkles,
+  Trash2,
+  TrendingUp,
+  Weight
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import AppShell from "@/components/AppShell";
+import type { AppTab } from "@/components/BottomNav";
+import EmptyState from "@/components/EmptyState";
+import GlassCard from "@/components/GlassCard";
+import MetricCard from "@/components/MetricCard";
+import OneXLogo from "@/components/OneXLogo";
+import PrimaryButton from "@/components/PrimaryButton";
+import ProgressBar from "@/components/ProgressBar";
+import StatBadge from "@/components/StatBadge";
+import WorkoutCard from "@/components/WorkoutCard";
+import BrandSignature from "@/components/BrandSignature";
 import { program } from "@/data/program";
+import { formatLongDate, formatShortDate, getNextWorkout, getWeekBounds, getWeekLabel, getWorkoutForDate, isSameDate, sortByDateDesc, todayKey } from "@/lib/dates";
+import { getCompletedCount, getProgressionSuggestion, getSessionProgress, hasExerciseInput } from "@/lib/progression";
 import {
-  getLastPerformance,
+  addExerciseHistoryFromSession,
+  clearOneXData,
+  deleteDraft,
+  deleteSession,
+  exportOneXData,
+  getDrafts,
+  getExerciseHistory,
+  getLastExerciseHistory,
   getSessions,
-  getTodayTracking,
+  getTrackingEntries,
+  getTrackingForDate,
+  importOneXData,
+  saveDraft,
   saveSession,
+  saveSettings,
   saveTracking
 } from "@/lib/storage";
-import type { DailyTracking, ExerciseLog, WorkoutDay, WorkoutSession } from "@/types";
+import type { DailyTracking, Exercise, ExerciseLog, ExerciseHistoryEntry, WorkoutDay, WorkoutDraft, WorkoutSession } from "@/types";
 
-type Tab = "dashboard" | "program" | "session" | "tracking" | "history";
-
-const today = () => new Date().toISOString().slice(0, 10);
-
-const navItems: { id: Tab; label: string; icon: LucideIcon }[] = [
-  { id: "dashboard", label: "Dashboard", icon: Home },
-  { id: "program", label: "Programme", icon: CalendarDays },
+const navItems = [
+  { id: "dashboard", label: "Home", icon: Home },
+  { id: "program", label: "Plan", icon: CalendarDays },
   { id: "session", label: "Seance", icon: Dumbbell },
   { id: "tracking", label: "Suivi", icon: Activity },
-  { id: "history", label: "Historique", icon: History }
-];
+  { id: "history", label: "Historique", icon: History },
+  { id: "settings", label: "Data", icon: Settings }
+] satisfies { id: AppTab; label: string; icon: LucideIcon }[];
 
 function createExerciseLogs(workout: WorkoutDay): ExerciseLog[] {
   return workout.exercises.map((exercise) => ({
     exerciseId: exercise.id,
     name: exercise.name,
+    target: exercise.target,
+    kind: exercise.kind,
     weight: "",
     reps: "",
     done: false,
@@ -49,63 +80,108 @@ function createExerciseLogs(workout: WorkoutDay): ExerciseLog[] {
   }));
 }
 
-function getWeekLabel() {
-  const now = new Date();
-  const start = new Date(now);
-  start.setDate(now.getDate() - ((now.getDay() + 6) % 7));
-  const end = new Date(start);
-  end.setDate(start.getDate() + 6);
-
-  return `${start.toLocaleDateString("fr-FR", { day: "2-digit", month: "short" })} - ${end.toLocaleDateString(
-    "fr-FR",
-    { day: "2-digit", month: "short" }
-  )}`;
+function formatNumber(value: number, fallback = "--") {
+  return Number.isFinite(value) && value > 0 ? Math.round(value).toString() : fallback;
 }
 
-function suggestProgress(log?: ExerciseLog) {
-  if (!log || (!log.reps && !log.weight)) return "Note ta premiere perf";
-  const reps = Number(log.reps);
-  if (Number.isFinite(reps) && reps > 0 && reps < 12) return "essaie +1 rep";
-  return "augmente la charge";
+function average(values: string[]) {
+  const nums = values.map((value) => Number(value.replace(",", "."))).filter((value) => Number.isFinite(value) && value > 0);
+  if (!nums.length) return 0;
+  return nums.reduce((sum, value) => sum + value, 0) / nums.length;
+}
+
+function doneExercises(session: WorkoutSession) {
+  return session.exercises.filter((exercise) => hasExerciseInput(exercise));
 }
 
 export default function OneXApp() {
-  const [activeTab, setActiveTab] = useState<Tab>("dashboard");
+  const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
   const [selectedWorkoutId, setSelectedWorkoutId] = useState(program[0].id);
   const [exerciseLogs, setExerciseLogs] = useState<ExerciseLog[]>(createExerciseLogs(program[0]));
   const [sessions, setSessions] = useState<WorkoutSession[]>([]);
-  const [tracking, setTracking] = useState<DailyTracking>({
-    date: today(),
-    weight: "",
-    calories: "",
-    protein: "",
-    steps: "",
-    note: ""
-  });
-  const [savedMessage, setSavedMessage] = useState("");
+  const [drafts, setDrafts] = useState<WorkoutDraft[]>([]);
+  const [trackingEntries, setTrackingEntries] = useState<DailyTracking[]>([]);
+  const [trackingDate, setTrackingDate] = useState(todayKey());
+  const [tracking, setTracking] = useState<DailyTracking>(getEmptyTracking(todayKey()));
+  const [exerciseHistory, setExerciseHistory] = useState<ExerciseHistoryEntry[]>([]);
+  const [toast, setToast] = useState("");
+  const [isHydrated, setIsHydrated] = useState(false);
+  const autoSaveReady = useRef(false);
 
   const selectedWorkout = useMemo(
     () => program.find((workout) => workout.id === selectedWorkoutId) ?? program[0],
     [selectedWorkoutId]
   );
 
+  const selectedDraft = useMemo(
+    () => drafts.find((draft) => draft.workoutId === selectedWorkout.id),
+    [drafts, selectedWorkout.id]
+  );
+
+  const todayWorkout = getWorkoutForDate();
+  const nextWorkout = todayWorkout ?? getNextWorkout();
+  const todaySession = sessions.find((session) => isSameDate(session.date, new Date()) && session.workoutId === todayWorkout?.id);
+  const lastSession = sessions[0];
+  const { start, end } = getWeekBounds();
+  const sessionsThisWeek = sessions.filter((session) => {
+    const date = new Date(session.date);
+    return date >= start && date <= end;
+  });
+  const currentDraft = drafts[0];
+
   useEffect(() => {
-    setSessions(getSessions());
-    setTracking(getTodayTracking(today()));
+    refreshData();
+    const settings = localStorageSafePreferredWorkout();
+    if (settings) setSelectedWorkoutId(settings);
+    setIsHydrated(true);
   }, []);
 
   useEffect(() => {
-    setExerciseLogs(createExerciseLogs(selectedWorkout));
-  }, [selectedWorkout]);
+    if (!isHydrated) return;
+    const draft = getDrafts().find((item) => item.workoutId === selectedWorkout.id);
+    setExerciseLogs(draft ? draft.exercises : createExerciseLogs(selectedWorkout));
+    autoSaveReady.current = true;
+  }, [isHydrated, selectedWorkout]);
 
-  const sessionsThisWeek = sessions.filter((session) => {
-    const sessionDate = new Date(session.date);
-    const now = new Date();
-    const start = new Date(now);
-    start.setDate(now.getDate() - ((now.getDay() + 6) % 7));
-    start.setHours(0, 0, 0, 0);
-    return sessionDate >= start;
-  }).length;
+  useEffect(() => {
+    if (!isHydrated) return;
+    setTracking(getTrackingForDate(trackingDate));
+  }, [isHydrated, trackingDate]);
+
+  useEffect(() => {
+    if (!isHydrated || !autoSaveReady.current) return;
+    if (!exerciseLogs.some(hasExerciseInput)) return;
+    persistDraft("auto");
+  }, [exerciseLogs]);
+
+  function localStorageSafePreferredWorkout() {
+    try {
+      return window.localStorage ? JSON.parse(window.localStorage.getItem("onex_settings") || "{}")?.preferredWorkoutId : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function refreshData() {
+    const nextSessions = sortByDateDesc(getSessions());
+    setSessions(nextSessions);
+    setDrafts(getDrafts());
+    const entries = sortByDateDesc(getTrackingEntries());
+    setTrackingEntries(entries);
+    setTracking(getTrackingForDate(trackingDate));
+    setExerciseHistory(getExerciseHistory());
+  }
+
+  function showToast(message: string) {
+    setToast(message);
+    window.setTimeout(() => setToast(""), 2600);
+  }
+
+  function startWorkout(workoutId: string) {
+    setSelectedWorkoutId(workoutId);
+    saveSettings({ preferredWorkoutId: workoutId });
+    setActiveTab("session");
+  }
 
   function updateExercise(index: number, field: keyof ExerciseLog, value: string | boolean) {
     setExerciseLogs((current) =>
@@ -115,213 +191,294 @@ export default function OneXApp() {
     );
   }
 
+  function copyLastPerformance(index: number, exercise: Exercise) {
+    const last = getLastExerciseHistory(exercise.id);
+    if (!last) return;
+    updateExercise(index, "weight", last.weight);
+    updateExercise(index, "reps", last.reps);
+    showToast("Derniere perf copiee.");
+  }
+
+  function persistDraft(source: "manual" | "auto" = "manual") {
+    const draft: WorkoutDraft = {
+      id: selectedDraft?.id ?? crypto.randomUUID(),
+      workoutId: selectedWorkout.id,
+      workoutTitle: selectedWorkout.shortTitle,
+      startedAt: selectedDraft?.startedAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      exercises: exerciseLogs
+    };
+
+    saveDraft(draft);
+    setDrafts(getDrafts());
+    if (source === "manual") showToast("Brouillon sauvegarde.");
+  }
+
+  function cancelDraft() {
+    const hasData = exerciseLogs.some(hasExerciseInput);
+    if (hasData && !window.confirm("Annuler cette seance et supprimer le brouillon ?")) return;
+    deleteDraft(selectedWorkout.id);
+    setExerciseLogs(createExerciseLogs(selectedWorkout));
+    refreshData();
+    showToast("Brouillon supprime.");
+  }
+
   function finishSession() {
+    if (!exerciseLogs.some(hasExerciseInput)) {
+      showToast("Ajoute au moins une performance avant de terminer.");
+      return;
+    }
+
     const session: WorkoutSession = {
       id: crypto.randomUUID(),
       workoutId: selectedWorkout.id,
       workoutTitle: selectedWorkout.shortTitle,
+      durationMinutes: selectedWorkout.estimatedMinutes,
       date: new Date().toISOString(),
       exercises: exerciseLogs
     };
 
     saveSession(session);
-    setSessions(getSessions());
+    addExerciseHistoryFromSession(session);
+    deleteDraft(selectedWorkout.id);
     setExerciseLogs(createExerciseLogs(selectedWorkout));
-    setSavedMessage("Seance terminee et sauvegardee.");
+    refreshData();
     setActiveTab("history");
-    window.setTimeout(() => setSavedMessage(""), 2400);
+    showToast("Seance terminee. Historique mis a jour.");
   }
 
   function submitTracking() {
     saveTracking(tracking);
-    setSavedMessage("Suivi sauvegarde.");
-    window.setTimeout(() => setSavedMessage(""), 2400);
+    refreshData();
+    showToast("Suivi sauvegarde.");
+  }
+
+  function handleDeleteSession(sessionId: string) {
+    if (!window.confirm("Supprimer cette seance de l'historique ?")) return;
+    deleteSession(sessionId);
+    refreshData();
+    showToast("Seance supprimee.");
+  }
+
+  function handleExport() {
+    const payload = exportOneXData();
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `onex-export-${todayKey()}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast("Export JSON prepare.");
+  }
+
+  function handleImport(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        if (!window.confirm("Importer ces donnees va remplacer les donnees locales OneX. Continuer ?")) return;
+        importOneXData(parsed);
+        refreshData();
+        showToast("Import termine.");
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : "Import impossible.");
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function handleReset() {
+    const first = window.confirm("Attention : cela supprimera toutes les donnees OneX locales. Continuer ?");
+    if (!first) return;
+    const second = window.confirm("Derniere confirmation : reset definitif ?");
+    if (!second) return;
+    clearOneXData();
+    setSelectedWorkoutId(program[0].id);
+    setExerciseLogs(createExerciseLogs(program[0]));
+    refreshData();
+    showToast("Donnees OneX reinitialisees.");
+  }
+
+  if (!isHydrated) {
+    return (
+      <AppShell date={formatLongDate()} week={getWeekLabel()} navItems={navItems} activeTab="dashboard" onTabChange={setActiveTab}>
+        <GlassCard className="mt-4">
+          <p className="text-sm text-slate-400">Chargement de tes donnees locales...</p>
+        </GlassCard>
+      </AppShell>
+    );
   }
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-md flex-col px-4 pb-28 pt-5">
-      <header className="mb-5 flex items-center justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.24em] text-onex-cyan">OneX</p>
-          <h1 className="text-3xl font-black tracking-normal">Training OS</h1>
-        </div>
-        <div className="rounded-full border border-white/10 bg-white/8 px-3 py-2 text-xs text-slate-300 shadow-glow backdrop-blur">
-          {getWeekLabel()}
-        </div>
-      </header>
-
-      {savedMessage ? (
-        <div className="mb-4 rounded-lg border border-cyan-300/30 bg-cyan-300/10 px-4 py-3 text-sm text-cyan-100">
-          {savedMessage}
+    <AppShell date={formatLongDate()} week={getWeekLabel()} navItems={navItems} activeTab={activeTab} onTabChange={setActiveTab}>
+      {toast ? (
+        <div className="fixed left-1/2 top-[max(env(safe-area-inset-top),0.75rem)] z-40 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 rounded-3xl border border-cyan-300/30 bg-cyan-300/[0.12] px-4 py-3 text-sm font-bold text-cyan-100 shadow-glow backdrop-blur-2xl">
+          {toast}
         </div>
       ) : null}
 
       {activeTab === "dashboard" ? (
-        <Dashboard sessionsThisWeek={sessionsThisWeek} tracking={tracking} openTab={setActiveTab} />
-      ) : null}
-      {activeTab === "program" ? (
-        <ProgramView
-          selectedWorkoutId={selectedWorkoutId}
-          onSelect={(workoutId) => {
-            setSelectedWorkoutId(workoutId);
-            setActiveTab("session");
-          }}
+        <DashboardView
+          tracking={trackingEntries.find((entry) => entry.date === todayKey()) ?? getEmptyTracking(todayKey())}
+          todayWorkout={todayWorkout}
+          nextWorkout={nextWorkout}
+          todaySession={todaySession}
+          currentDraft={currentDraft}
+          sessionsThisWeek={sessionsThisWeek.length}
+          lastSession={lastSession}
+          onStart={startWorkout}
+          onTab={setActiveTab}
         />
       ) : null}
+
+      {activeTab === "program" ? <ProgramView selectedWorkoutId={selectedWorkoutId} onStart={startWorkout} /> : null}
+
       {activeTab === "session" ? (
         <SessionView
           selectedWorkout={selectedWorkout}
           exerciseLogs={exerciseLogs}
-          onWorkoutChange={setSelectedWorkoutId}
+          drafts={drafts}
+          onWorkoutChange={startWorkout}
           onExerciseChange={updateExercise}
+          onCopyLast={copyLastPerformance}
+          onSaveDraft={() => persistDraft("manual")}
+          onCancel={cancelDraft}
           onFinish={finishSession}
         />
       ) : null}
+
       {activeTab === "tracking" ? (
-        <TrackingView tracking={tracking} setTracking={setTracking} onSave={submitTracking} />
+        <TrackingView
+          tracking={tracking}
+          setTracking={setTracking}
+          trackingDate={trackingDate}
+          setTrackingDate={setTrackingDate}
+          entries={trackingEntries}
+          onSave={submitTracking}
+        />
       ) : null}
-      {activeTab === "history" ? <HistoryView sessions={sessions} /> : null}
 
-      <nav className="fixed inset-x-0 bottom-0 z-20 border-t border-white/10 bg-black/75 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-2 backdrop-blur-xl">
-        <div className="mx-auto grid max-w-md grid-cols-5 gap-1">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const isActive = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setActiveTab(item.id)}
-                className={`flex h-14 flex-col items-center justify-center gap-1 rounded-lg text-[0.68rem] transition ${
-                  isActive ? "bg-white/12 text-cyan-200" : "text-slate-500"
-                }`}
-                aria-label={item.label}
-              >
-                <Icon size={19} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      </nav>
-    </main>
+      {activeTab === "history" ? (
+        <HistoryView sessions={sessions} onDelete={handleDeleteSession} />
+      ) : null}
+
+      {activeTab === "settings" ? (
+        <SettingsView
+          sessions={sessions.length}
+          drafts={drafts.length}
+          tracking={trackingEntries.length}
+          exerciseHistory={exerciseHistory.length}
+          onExport={handleExport}
+          onImport={handleImport}
+          onReset={handleReset}
+        />
+      ) : null}
+    </AppShell>
   );
 }
 
-function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return (
-    <section className={`rounded-lg border border-white/10 bg-onex-panelSoft p-4 shadow-glow backdrop-blur ${className}`}>
-      {children}
-    </section>
-  );
+function getEmptyTracking(date: string): DailyTracking {
+  return { date, weight: "", calories: "", protein: "", steps: "", score: "", note: "" };
 }
 
-function Dashboard({
-  sessionsThisWeek,
+function DashboardView({
   tracking,
-  openTab
+  todayWorkout,
+  nextWorkout,
+  todaySession,
+  currentDraft,
+  sessionsThisWeek,
+  lastSession,
+  onStart,
+  onTab
 }: {
-  sessionsThisWeek: number;
   tracking: DailyTracking;
-  openTab: (tab: Tab) => void;
+  todayWorkout?: WorkoutDay;
+  nextWorkout: WorkoutDay;
+  todaySession?: WorkoutSession;
+  currentDraft?: WorkoutDraft;
+  sessionsThisWeek: number;
+  lastSession?: WorkoutSession;
+  onStart: (workoutId: string) => void;
+  onTab: (tab: AppTab) => void;
 }) {
+  const featured = todayWorkout ?? nextWorkout;
+  const title = todaySession ? "Seance terminee" : currentDraft ? "Reprendre la seance" : todayWorkout ? "Seance du jour" : "Prochaine seance";
+
   return (
     <div className="space-y-4">
-      <Card className="bg-gradient-to-br from-violet-500/20 via-blue-500/12 to-cyan-400/10">
-        <div className="flex items-end justify-between">
-          <div>
-            <p className="text-sm text-slate-300">Seances faites</p>
-            <p className="mt-1 text-5xl font-black">{sessionsThisWeek}/4</p>
+      <GlassCard className="relative overflow-hidden bg-gradient-to-br from-violet-500/20 via-blue-500/[0.12] to-cyan-300/[0.12]">
+        <div className="absolute right-[-3rem] top-[-3rem] h-32 w-32 rounded-full bg-cyan-300/20 blur-3xl" />
+        <div className="relative">
+          <OneXLogo size="lg" showSignature className="mb-6" />
+          <div className="mb-4 flex items-start justify-between gap-3">
+            <div>
+              <StatBadge tone={todaySession ? "green" : currentDraft ? "violet" : "cyan"}>{title}</StatBadge>
+              <h2 className="mt-3 text-3xl font-black leading-tight">{featured.shortTitle}</h2>
+              <p className="mt-2 text-sm leading-6 text-slate-300">{featured.focus}</p>
+            </div>
+            <div className="rounded-3xl border border-white/10 bg-black/20 p-3">
+              <Dumbbell className="text-cyan-100" size={28} />
+            </div>
           </div>
-          <button
-            type="button"
-            onClick={() => openTab("session")}
-            className="flex items-center gap-2 rounded-lg bg-cyan-300 px-4 py-3 text-sm font-bold text-black"
-          >
-            <Plus size={17} />
-            Log
-          </button>
+          <ProgressBar value={(sessionsThisWeek / 4) * 100} label={`${sessionsThisWeek} / 4 seances cette semaine`} />
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            <PrimaryButton disabled={Boolean(todaySession)} onClick={() => onStart(currentDraft?.workoutId ?? featured.id)}>
+              <Play size={18} />
+              {currentDraft ? "Reprendre" : "Commencer"}
+            </PrimaryButton>
+            <PrimaryButton variant="secondary" onClick={() => onTab("program")}>
+              Voir programme
+            </PrimaryButton>
+          </div>
         </div>
-      </Card>
+      </GlassCard>
 
-      <div className="grid grid-cols-3 gap-3">
-        <Metric icon={Scale} label="Poids" value={tracking.weight || "--"} unit="kg" />
-        <Metric icon={Flame} label="Calories" value={tracking.calories || "--"} unit="kcal" />
-        <Metric icon={Dumbbell} label="Proteines" value={tracking.protein || "--"} unit="g" />
+      <div className="grid grid-cols-2 gap-3">
+        <MetricCard icon={Weight} label="Poids" value={tracking.weight || "--"} unit="kg" />
+        <MetricCard icon={Flame} label="Calories" value={tracking.calories || "--"} unit="kcal" />
+        <MetricCard icon={Dumbbell} label="Proteines" value={tracking.protein || "--"} unit="g" />
+        <MetricCard icon={Activity} label="Steps" value={tracking.steps || "--"} unit="pas" />
       </div>
 
-      <Card>
-        <h2 className="mb-3 text-lg font-bold">Semaine actuelle</h2>
-        <div className="space-y-3">
-          {program.map((workout) => (
-            <div key={workout.id} className="flex items-center justify-between rounded-lg bg-white/6 px-3 py-3">
-              <div>
-                <p className="text-sm font-bold">{workout.day}</p>
-                <p className="text-sm text-slate-400">{workout.shortTitle}</p>
-              </div>
-              <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300">
-                {workout.exercises.length} exos
-              </span>
-            </div>
-          ))}
+      <GlassCard>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-bold text-cyan-200">Focus du jour</p>
+            <h3 className="mt-1 text-xl font-black">{featured.muscleGroups.join(" / ")}</h3>
+            <p className="mt-2 text-sm leading-6 text-slate-400">{featured.estimatedMinutes} min estimees · {featured.exercises.length} exercices</p>
+          </div>
+          <Sparkles className="shrink-0 text-violet-200" />
         </div>
-      </Card>
+      </GlassCard>
+
+      {lastSession ? (
+        <GlassCard>
+          <p className="text-sm font-bold text-cyan-200">Dernier entrainement</p>
+          <div className="mt-2 flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-xl font-black">{lastSession.workoutTitle}</h3>
+              <p className="mt-1 text-sm text-slate-400">{formatShortDate(lastSession.date)} · {doneExercises(lastSession).length} exercices notes</p>
+            </div>
+            <TrendingUp className="text-cyan-200" />
+          </div>
+        </GlassCard>
+      ) : (
+        <EmptyState icon={History} title="Aucun historique" text="Termine ta premiere seance pour debloquer le suivi de progression." />
+      )}
     </div>
   );
 }
 
-function Metric({
-  icon: Icon,
-  label,
-  value,
-  unit
-}: {
-  icon: LucideIcon;
-  label: string;
-  value: string;
-  unit: string;
-}) {
-  return (
-    <Card className="p-3">
-      <Icon size={18} className="mb-3 text-cyan-200" />
-      <p className="text-xs text-slate-400">{label}</p>
-      <p className="mt-1 text-lg font-black">
-        {value} <span className="text-[0.65rem] font-medium text-slate-500">{unit}</span>
-      </p>
-    </Card>
-  );
-}
-
-function ProgramView({
-  selectedWorkoutId,
-  onSelect
-}: {
-  selectedWorkoutId: string;
-  onSelect: (workoutId: string) => void;
-}) {
+function ProgramView({ selectedWorkoutId, onStart }: { selectedWorkoutId: string; onStart: (workoutId: string) => void }) {
   return (
     <div className="space-y-4">
+      <SectionTitle title="Programme integre" text="Ta semaine OneX, simple et fixe pour progresser sans te disperser." />
       {program.map((workout) => (
-        <Card key={workout.id} className={selectedWorkoutId === workout.id ? "border-cyan-300/45" : ""}>
-          <button type="button" onClick={() => onSelect(workout.id)} className="w-full text-left">
-            <div className="mb-3 flex items-center justify-between">
-              <div>
-                <p className="text-sm text-cyan-200">{workout.day}</p>
-                <h2 className="text-2xl font-black">{workout.title}</h2>
-              </div>
-              <Dumbbell className="text-violet-300" size={24} />
-            </div>
-            <div className="space-y-2">
-              {workout.exercises.map((exercise) => (
-                <div key={exercise.id} className="flex justify-between gap-3 text-sm">
-                  <span className="text-slate-200">{exercise.name}</span>
-                  <span className="shrink-0 text-slate-500">{exercise.target}</span>
-                </div>
-              ))}
-            </div>
-          </button>
-        </Card>
+        <WorkoutCard key={workout.id} workout={workout} onStart={onStart} />
       ))}
+      <p className="px-1 text-xs text-slate-500">Selection actuelle : {program.find((workout) => workout.id === selectedWorkoutId)?.shortTitle}</p>
     </div>
   );
 }
@@ -329,220 +486,421 @@ function ProgramView({
 function SessionView({
   selectedWorkout,
   exerciseLogs,
+  drafts,
   onWorkoutChange,
   onExerciseChange,
+  onCopyLast,
+  onSaveDraft,
+  onCancel,
   onFinish
 }: {
   selectedWorkout: WorkoutDay;
   exerciseLogs: ExerciseLog[];
+  drafts: WorkoutDraft[];
   onWorkoutChange: (workoutId: string) => void;
   onExerciseChange: (index: number, field: keyof ExerciseLog, value: string | boolean) => void;
+  onCopyLast: (index: number, exercise: Exercise) => void;
+  onSaveDraft: () => void;
+  onCancel: () => void;
   onFinish: () => void;
 }) {
+  const progress = getSessionProgress(exerciseLogs);
+  const completed = getCompletedCount(exerciseLogs);
+  const activeDraft = drafts.find((draft) => draft.workoutId === selectedWorkout.id);
+
   return (
     <div className="space-y-4">
-      <Card>
-        <label className="text-sm text-slate-400" htmlFor="workout-select">
-          Seance du jour
+      <GlassCard className="space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-bold text-cyan-200">Seance active</p>
+            <h2 className="mt-1 text-2xl font-black">{selectedWorkout.shortTitle}</h2>
+            <p className="mt-1 text-sm text-slate-400">{completed}/{exerciseLogs.length} exercices faits</p>
+          </div>
+          {activeDraft ? <StatBadge tone="violet">Brouillon</StatBadge> : <StatBadge tone="slate">Pret</StatBadge>}
+        </div>
+        <ProgressBar value={progress} />
+        <label className="block">
+          <span className="mb-2 block text-xs font-bold uppercase tracking-[0.16em] text-slate-500">Changer de seance</span>
+          <select
+            value={selectedWorkout.id}
+            onChange={(event) => onWorkoutChange(event.target.value)}
+            className="min-h-12 w-full rounded-2xl border border-white/10 bg-black/40 px-4 text-sm font-bold text-white outline-none focus:border-cyan-300/60"
+          >
+            {program.map((workout) => (
+              <option key={workout.id} value={workout.id}>
+                {workout.day} - {workout.shortTitle}
+              </option>
+            ))}
+          </select>
         </label>
-        <select
-          id="workout-select"
-          value={selectedWorkout.id}
-          onChange={(event) => onWorkoutChange(event.target.value)}
-          className="mt-2 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-3 text-white outline-none"
-        >
-          {program.map((workout) => (
-            <option key={workout.id} value={workout.id}>
-              {workout.day} - {workout.shortTitle}
-            </option>
-          ))}
-        </select>
-      </Card>
+      </GlassCard>
 
-      {exerciseLogs.map((exercise, index) => {
-        const lastSession = getLastPerformance(exercise.exerciseId);
-        const lastLog = lastSession?.exercises.find((item) => item.exerciseId === exercise.exerciseId);
-
+      {exerciseLogs.map((log, index) => {
+        const exercise = selectedWorkout.exercises[index];
+        const last = exercise ? getLastExerciseHistory(exercise.id) : undefined;
         return (
-          <Card key={exercise.exerciseId}>
-            <div className="mb-3 flex items-start justify-between gap-3">
-              <div>
-                <h2 className="font-bold">{exercise.name}</h2>
-                <p className="text-sm text-cyan-200">{selectedWorkout.exercises[index]?.target}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => onExerciseChange(index, "done", !exercise.done)}
-                className={`grid h-10 w-10 place-items-center rounded-lg border ${
-                  exercise.done ? "border-cyan-300 bg-cyan-300 text-black" : "border-white/15 text-slate-500"
-                }`}
-                aria-label="Marquer comme fait"
-              >
-                <Check size={18} />
-              </button>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Input
-                label="Charge"
-                value={exercise.weight}
-                placeholder="kg"
-                onChange={(value) => onExerciseChange(index, "weight", value)}
-              />
-              <Input
-                label="Reps"
-                value={exercise.reps}
-                placeholder="total"
-                onChange={(value) => onExerciseChange(index, "reps", value)}
-              />
-            </div>
-            <textarea
-              value={exercise.notes}
-              onChange={(event) => onExerciseChange(index, "notes", event.target.value)}
-              placeholder="Notes"
-              className="mt-3 min-h-20 w-full resize-none rounded-lg border border-white/10 bg-black/35 px-3 py-3 text-sm outline-none placeholder:text-slate-600 focus:border-cyan-300/60"
-            />
-            <p className="mt-3 text-xs text-slate-400">
-              Derniere perf: {lastLog ? `${lastLog.weight || "--"} kg / ${lastLog.reps || "--"} reps` : "aucune"} ·{" "}
-              <span className="text-cyan-200">{suggestProgress(lastLog)}</span>
-            </p>
-          </Card>
+          <ExerciseCard
+            key={log.exerciseId}
+            exercise={exercise}
+            log={log}
+            last={last}
+            index={index}
+            onChange={onExerciseChange}
+            onCopyLast={onCopyLast}
+          />
         );
       })}
 
-      <button
-        type="button"
-        onClick={onFinish}
-        className="flex h-14 w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-violet-400 via-blue-400 to-cyan-300 text-sm font-black text-black"
-      >
+      <div className="grid grid-cols-2 gap-3">
+        <PrimaryButton variant="secondary" onClick={onSaveDraft}>
+          <Shield size={18} />
+          Sauvegarder
+        </PrimaryButton>
+        <PrimaryButton variant="danger" onClick={onCancel}>
+          <RotateCcw size={18} />
+          Annuler
+        </PrimaryButton>
+      </div>
+      <PrimaryButton className="w-full" disabled={!exerciseLogs.some(hasExerciseInput)} onClick={onFinish}>
         <Check size={19} />
         Terminer seance
-      </button>
+      </PrimaryButton>
     </div>
+  );
+}
+
+function ExerciseCard({
+  exercise,
+  log,
+  last,
+  index,
+  onChange,
+  onCopyLast
+}: {
+  exercise?: Exercise;
+  log: ExerciseLog;
+  last?: ExerciseHistoryEntry;
+  index: number;
+  onChange: (index: number, field: keyof ExerciseLog, value: string | boolean) => void;
+  onCopyLast: (index: number, exercise: Exercise) => void;
+}) {
+  const suggestion = exercise ? getProgressionSuggestion(exercise, last) : "Note ta performance";
+
+  return (
+    <GlassCard className={log.done ? "border-cyan-300/[0.35] bg-cyan-300/[0.075]" : ""}>
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-lg font-black leading-tight">{log.name}</h3>
+          <p className="mt-1 text-sm font-bold text-cyan-200">{log.target}</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => onChange(index, "done", !log.done)}
+          className={`grid h-12 w-12 shrink-0 place-items-center rounded-2xl border transition active:scale-95 ${
+            log.done ? "border-cyan-200 bg-cyan-200 text-black" : "border-white/12 bg-white/[0.08] text-slate-500"
+          }`}
+          aria-label="Marquer comme fait"
+        >
+          <Check size={20} />
+        </button>
+      </div>
+      <div className="mb-3 rounded-2xl border border-white/[0.08] bg-black/25 p-3 text-sm">
+        <p className="text-slate-500">Derniere perf</p>
+        <p className="mt-1 font-bold text-slate-200">
+          {last ? `${last.weight || "--"} kg / ${last.reps || "--"} reps · ${formatShortDate(last.date)}` : "Aucune donnee"}
+        </p>
+        <p className="mt-2 text-cyan-100">{suggestion}</p>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Charge" value={log.weight} placeholder="kg" inputMode="decimal" onChange={(value) => onChange(index, "weight", value)} />
+        <Field label="Reps" value={log.reps} placeholder="total" inputMode="numeric" onChange={(value) => onChange(index, "reps", value)} />
+      </div>
+      <textarea
+        value={log.notes}
+        onChange={(event) => onChange(index, "notes", event.target.value)}
+        placeholder="Notes rapides"
+        className="mt-3 min-h-20 w-full resize-none rounded-2xl border border-white/10 bg-black/[0.35] px-4 py-3 text-base outline-none placeholder:text-slate-600 focus:border-cyan-300/60"
+      />
+      <PrimaryButton
+        variant="secondary"
+        className="mt-3 w-full"
+        disabled={!last || !exercise}
+        onClick={() => exercise && onCopyLast(index, exercise)}
+      >
+        <Copy size={17} />
+        Copier derniere perf
+      </PrimaryButton>
+    </GlassCard>
   );
 }
 
 function TrackingView({
   tracking,
   setTracking,
+  trackingDate,
+  setTrackingDate,
+  entries,
   onSave
 }: {
   tracking: DailyTracking;
-  setTracking: Dispatch<SetStateAction<DailyTracking>>;
+  setTracking: (value: DailyTracking | ((current: DailyTracking) => DailyTracking)) => void;
+  trackingDate: string;
+  setTrackingDate: (date: string) => void;
+  entries: DailyTracking[];
   onSave: () => void;
 }) {
+  const lastSeven = entries.slice(0, 7);
+  const totalSteps = lastSeven.reduce((sum, entry) => sum + Number(entry.steps || 0), 0);
+  const avgWeight = average(lastSeven.map((entry) => entry.weight));
+  const avgCalories = average(lastSeven.map((entry) => entry.calories));
+  const avgProtein = average(lastSeven.map((entry) => entry.protein));
+
   const update = (field: keyof DailyTracking, value: string) => {
     setTracking((current) => ({ ...current, [field]: value }));
   };
 
   return (
     <div className="space-y-4">
-      <Card>
-        <div className="mb-4 flex items-center justify-between">
-          <div>
-            <p className="text-sm text-cyan-200">Suivi quotidien</p>
-            <h2 className="text-2xl font-black">{tracking.date}</h2>
-          </div>
-          <NotebookPen className="text-violet-300" />
-        </div>
+      <SectionTitle title="Suivi quotidien" text="Poids, nutrition, steps et ressenti. Une entree par date." />
+      <div className="grid grid-cols-2 gap-3">
+        <MetricCard icon={Weight} label="Moy. poids 7j" value={avgWeight ? avgWeight.toFixed(1) : "--"} unit="kg" />
+        <MetricCard icon={Activity} label="Steps semaine" value={formatNumber(totalSteps)} />
+        <MetricCard icon={Flame} label="Moy. kcal" value={formatNumber(avgCalories)} />
+        <MetricCard icon={Dumbbell} label="Moy. prot." value={formatNumber(avgProtein)} unit="g" />
+      </div>
+
+      <GlassCard className="space-y-4">
+        <Field label="Date" value={trackingDate} type="date" onChange={setTrackingDate} />
         <div className="grid grid-cols-2 gap-3">
-          <Input label="Poids" value={tracking.weight} placeholder="kg" onChange={(value) => update("weight", value)} />
-          <Input
-            label="Calories"
-            value={tracking.calories}
-            placeholder="kcal"
-            onChange={(value) => update("calories", value)}
-          />
-          <Input
-            label="Proteines"
-            value={tracking.protein}
-            placeholder="g"
-            onChange={(value) => update("protein", value)}
-          />
-          <Input label="Steps" value={tracking.steps} placeholder="pas" onChange={(value) => update("steps", value)} />
+          <Field label="Poids" value={tracking.weight} placeholder="kg" inputMode="decimal" onChange={(value) => update("weight", value)} />
+          <Field label="Calories" value={tracking.calories} placeholder="kcal" inputMode="numeric" onChange={(value) => update("calories", value)} />
+          <Field label="Proteines" value={tracking.protein} placeholder="g" inputMode="numeric" onChange={(value) => update("protein", value)} />
+          <Field label="Steps" value={tracking.steps} placeholder="pas" inputMode="numeric" onChange={(value) => update("steps", value)} />
         </div>
+        <Field label="Score journee /10" value={tracking.score} placeholder="8" inputMode="numeric" onChange={(value) => update("score", value)} />
         <textarea
           value={tracking.note}
           onChange={(event) => update("note", event.target.value)}
           placeholder="Note du jour"
-          className="mt-3 min-h-24 w-full resize-none rounded-lg border border-white/10 bg-black/35 px-3 py-3 text-sm outline-none placeholder:text-slate-600 focus:border-cyan-300/60"
+          className="min-h-24 w-full resize-none rounded-2xl border border-white/10 bg-black/[0.35] px-4 py-3 text-base outline-none placeholder:text-slate-600 focus:border-cyan-300/60"
         />
-      </Card>
-      <button
-        type="button"
-        onClick={onSave}
-        className="flex h-14 w-full items-center justify-center gap-2 rounded-lg bg-cyan-300 text-sm font-black text-black"
-      >
-        <Check size={19} />
-        Sauvegarder
-      </button>
+        <PrimaryButton className="w-full" onClick={onSave}>
+          <Check size={18} />
+          Sauvegarder le suivi
+        </PrimaryButton>
+      </GlassCard>
+
+      <GlassCard>
+        <h3 className="text-lg font-black">7 derniers jours</h3>
+        {lastSeven.length ? (
+          <div className="mt-3 space-y-2">
+            {lastSeven.map((entry) => (
+              <div key={entry.date} className="rounded-2xl bg-black/[0.24] p-3 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="font-bold">{formatShortDate(entry.date)}</p>
+                  <p className="text-slate-400">{entry.score ? `${entry.score}/10` : "score --"}</p>
+                </div>
+                <p className="mt-1 text-slate-400">
+                  {entry.weight || "--"} kg · {entry.calories || "--"} kcal · {entry.protein || "--"} g · {entry.steps || "--"} pas
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-2 text-sm text-slate-400">Aucune donnee de suivi pour l'instant.</p>
+        )}
+      </GlassCard>
     </div>
   );
 }
 
-function HistoryView({ sessions }: { sessions: WorkoutSession[] }) {
-  if (!sessions.length) {
-    return (
-      <Card className="text-center">
-        <History className="mx-auto mb-3 text-slate-500" size={32} />
-        <h2 className="text-xl font-black">Aucune seance</h2>
-        <p className="mt-2 text-sm text-slate-400">Termine une seance pour voir ton historique ici.</p>
-      </Card>
-    );
-  }
+function HistoryView({ sessions, onDelete }: { sessions: WorkoutSession[]; onDelete: (sessionId: string) => void }) {
+  const [filter, setFilter] = useState("all");
+  const [query, setQuery] = useState("");
+  const [openId, setOpenId] = useState<string | null>(sessions[0]?.id ?? null);
+
+  const visibleSessions = sessions.filter((session) => {
+    const matchesFilter = filter === "all" || session.workoutId === filter;
+    const matchesQuery =
+      !query.trim() ||
+      session.exercises.some((exercise) => exercise.name.toLowerCase().includes(query.trim().toLowerCase()));
+    return matchesFilter && matchesQuery;
+  });
 
   return (
     <div className="space-y-4">
-      {sessions.map((session) => (
-        <Card key={session.id}>
-          <div className="mb-3 flex items-center justify-between">
-            <div>
-              <p className="text-sm text-cyan-200">{new Date(session.date).toLocaleDateString("fr-FR")}</p>
-              <h2 className="text-xl font-black">{session.workoutTitle}</h2>
-            </div>
-            <BarChart3 className="text-violet-300" />
-          </div>
-          <div className="space-y-2">
-            {session.exercises
-              .filter((exercise) => exercise.done || exercise.weight || exercise.reps || exercise.notes)
-              .map((exercise) => (
-                <div key={exercise.exerciseId} className="rounded-lg bg-white/6 px-3 py-2 text-sm">
-                  <div className="flex justify-between gap-3">
-                    <span className="font-semibold">{exercise.name}</span>
-                    <span className="text-slate-400">
-                      {exercise.weight || "--"} kg / {exercise.reps || "--"} reps
-                    </span>
+      <SectionTitle title="Historique" text="Tes seances terminees, filtrables par type ou par exercice." />
+      <GlassCard className="space-y-3">
+        <label className="relative block">
+          <Search className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Rechercher un exercice"
+            className="h-12 w-full rounded-2xl border border-white/10 bg-black/[0.35] pl-11 pr-4 text-base outline-none placeholder:text-slate-600 focus:border-cyan-300/60"
+          />
+        </label>
+        <select
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          className="h-12 w-full rounded-2xl border border-white/10 bg-black/40 px-4 text-sm font-bold text-white outline-none focus:border-cyan-300/60"
+        >
+          <option value="all">Toutes les seances</option>
+          {program.map((workout) => (
+            <option key={workout.id} value={workout.id}>
+              {workout.shortTitle}
+            </option>
+          ))}
+        </select>
+      </GlassCard>
+
+      {!visibleSessions.length ? (
+        <EmptyState icon={History} title="Rien a afficher" text="Termine une seance ou modifie tes filtres pour voir ton historique." />
+      ) : (
+        visibleSessions.map((session) => {
+          const isOpen = openId === session.id;
+          const exercises = doneExercises(session);
+          return (
+            <GlassCard key={session.id}>
+              <button type="button" className="w-full text-left" onClick={() => setOpenId(isOpen ? null : session.id)}>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-bold text-cyan-200">{formatShortDate(session.date)}</p>
+                    <h3 className="mt-1 text-xl font-black">{session.workoutTitle}</h3>
+                    <p className="mt-1 text-sm text-slate-400">
+                      ~{session.durationMinutes ?? 60} min · {exercises.length} exercices notes
+                    </p>
                   </div>
-                  {exercise.notes ? <p className="mt-1 text-xs text-slate-500">{exercise.notes}</p> : null}
+                  <ChevronDown className={`mt-2 text-slate-400 transition ${isOpen ? "rotate-180" : ""}`} />
                 </div>
-              ))}
-          </div>
-        </Card>
-      ))}
+              </button>
+              {isOpen ? (
+                <div className="mt-4 space-y-2">
+                  {exercises.map((exercise) => (
+                    <div key={exercise.exerciseId} className="rounded-2xl bg-black/[0.24] p-3 text-sm">
+                      <div className="flex justify-between gap-3">
+                        <p className="font-bold">{exercise.name}</p>
+                        <p className="shrink-0 text-slate-300">{exercise.weight || "--"} kg / {exercise.reps || "--"} reps</p>
+                      </div>
+                      {exercise.notes ? <p className="mt-1 text-slate-500">{exercise.notes}</p> : null}
+                    </div>
+                  ))}
+                  <PrimaryButton variant="danger" className="mt-2 w-full" onClick={() => onDelete(session.id)}>
+                    <Trash2 size={17} />
+                    Supprimer cette seance
+                  </PrimaryButton>
+                </div>
+              ) : null}
+            </GlassCard>
+          );
+        })
+      )}
     </div>
   );
 }
 
-function Input({
+function SettingsView({
+  sessions,
+  drafts,
+  tracking,
+  exerciseHistory,
+  onExport,
+  onImport,
+  onReset
+}: {
+  sessions: number;
+  drafts: number;
+  tracking: number;
+  exerciseHistory: number;
+  onExport: () => void;
+  onImport: (file: File) => void;
+  onReset: () => void;
+}) {
+  return (
+    <div className="space-y-4">
+      <GlassCard>
+        <OneXLogo size="md" showSignature />
+      </GlassCard>
+      <SectionTitle title="Donnees locales" text="Tout reste sur ton iPhone. Exporte un JSON pour garder une sauvegarde." />
+      <div className="grid grid-cols-2 gap-3">
+        <MetricCard icon={History} label="Seances" value={String(sessions)} />
+        <MetricCard icon={Shield} label="Brouillons" value={String(drafts)} />
+        <MetricCard icon={NotebookPen} label="Suivis" value={String(tracking)} />
+        <MetricCard icon={BarChart3} label="Perfs" value={String(exerciseHistory)} />
+      </div>
+      <GlassCard className="space-y-3">
+        <PrimaryButton className="w-full" onClick={onExport}>
+          <Shield size={18} />
+          Exporter mes donnees JSON
+        </PrimaryButton>
+        <label className="flex min-h-12 cursor-pointer items-center justify-center rounded-2xl border border-white/12 bg-white/10 px-4 py-3 text-sm font-black text-white transition active:scale-[0.98]">
+          Importer un JSON OneX
+          <input
+            type="file"
+            accept="application/json"
+            className="sr-only"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) onImport(file);
+              event.currentTarget.value = "";
+            }}
+          />
+        </label>
+      </GlassCard>
+      <GlassCard className="border-rose-400/30 bg-rose-500/10">
+        <h3 className="text-lg font-black text-rose-100">Zone dangereuse</h3>
+        <p className="mt-2 text-sm leading-6 text-rose-100/75">
+          Le reset supprime les seances, brouillons, suivis, historiques exercices et parametres locaux. Deux confirmations sont demandees.
+        </p>
+        <PrimaryButton variant="danger" className="mt-4 w-full" onClick={onReset}>
+          <Trash2 size={17} />
+          Reinitialiser OneX
+        </PrimaryButton>
+      </GlassCard>
+      <div className="pb-2 text-center">
+        <BrandSignature />
+      </div>
+    </div>
+  );
+}
+
+function Field({
   label,
   value,
   placeholder,
+  inputMode,
+  type = "text",
   onChange
 }: {
   label: string;
   value: string;
-  placeholder: string;
+  placeholder?: string;
+  inputMode?: "decimal" | "numeric";
+  type?: string;
   onChange: (value: string) => void;
 }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-xs text-slate-400">{label}</span>
+      <span className="mb-2 block text-xs font-bold uppercase tracking-[0.16em] text-slate-500">{label}</span>
       <input
         value={value}
-        inputMode="decimal"
+        type={type}
+        inputMode={inputMode}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
-        className="h-12 w-full rounded-lg border border-white/10 bg-black/35 px-3 text-sm outline-none placeholder:text-slate-600 focus:border-cyan-300/60"
+        className="min-h-12 w-full rounded-2xl border border-white/10 bg-black/[0.35] px-4 text-base font-semibold outline-none placeholder:text-slate-600 focus:border-cyan-300/60 focus:ring-2 focus:ring-cyan-300/10"
       />
     </label>
+  );
+}
+
+function SectionTitle({ title, text }: { title: string; text: string }) {
+  return (
+    <div className="px-1">
+      <OneXLogo size="sm" className="mb-3 scale-[0.82] origin-left" />
+      <h2 className="mt-1 text-2xl font-black">{title}</h2>
+      <p className="mt-2 text-sm leading-6 text-slate-400">{text}</p>
+    </div>
   );
 }

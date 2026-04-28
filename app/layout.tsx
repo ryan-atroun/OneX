@@ -4,10 +4,16 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "OneX",
   description: "Application fitness premium pour suivre tes seances et ta progression.",
+  applicationName: "OneX",
   manifest: "/manifest.json",
   icons: {
-    icon: "/icon.svg",
-    apple: "/icon.svg"
+    icon: "/icons/onex-icon.svg",
+    apple: "/icons/icon-192.png"
+  },
+  other: {
+    "apple-mobile-web-app-capable": "yes",
+    "apple-mobile-web-app-title": "OneX",
+    "mobile-web-app-capable": "yes"
   },
   appleWebApp: {
     capable: true,
