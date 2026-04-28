@@ -1,0 +1,19 @@
+{
+  "name": "OneX",
+  "short_name": "OneX",
+  "description": "Application fitness premium pour suivre entrainements, progression et tracking.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#050509",
+  "theme_color": "#050509",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
